@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# Manual Wi-Fi extender on the USB dongle only.
+#   extender_go --start
+#   extender_go --stop
+# The internal Wi-Fi stays on its current connection.
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${DIR}/extender.env"
+
+usage() {
+  echo "Usage: extender_go --start | --stop" >&2
+  exit 1
+}
+
+if [[ "${1:-}" != "--start" && "${1:-}" != "--stop" && "${1:-}" != "--watch" ]]; then
+  usage
+fi
+
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "Missing ${ENV_FILE}. Copy extender.env.example first." >&2
+  exit 1
+fi
+
+# shellcheck disable=SC1090
+source "${ENV_FILE}"
+
+USB_IF="${USB_IF:-}"
+: "${CON_NAME:?}"
+: "${SSID:?}"
+: "${BAND:?}"
+: "${CHANNEL:?}"
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  exec sudo -E bash "$0" "$@"
+fi
+
+export PATH="/usr/sbin:/sbin:${PATH}"
+
+# Docker sets filter FORWARD policy to drop and only accepts its bridges.
+# Packets from the dongle are forwarded traffic, so they die there.
+# DOCKER-USER is the chain Docker leaves for this kind of exception.
+ensure_docker_forward() {
+  local rule
+  local -a rules=(
+    "-s 10.42.0.0/24 -i ${USB_IF} -j ACCEPT"
+    "-d 10.42.0.0/24 -o ${USB_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+  )
+  for rule in "${rules[@]}"; do
+    # shellcheck disable=SC2086
+    iptables -C DOCKER-USER ${rule} 2>/dev/null || iptables -I DOCKER-USER 1 ${rule}
+  done
+}
+
+remove_docker_forward() {
+  local spec
+  # Match the subnet, not the USB port name. A moved dongle gets a new interface.
+  while read -r spec; do
+    [[ -z "${spec}" ]] && continue
+    # shellcheck disable=SC2086
+    iptables -D DOCKER-USER ${spec}
+  done < <(iptables -S DOCKER-USER | awk '/10\.42\.0\.0\/24/ {sub(/^-A DOCKER-USER /,""); print}')
+}
+
+ensure_nat_policies() {
+  local changed=0
+  if ! firewall-cmd --permanent --info-policy=extender-nat >/dev/null 2>&1; then
+    firewall-cmd --permanent --new-policy=extender-nat
+    firewall-cmd --permanent --policy=extender-nat --set-target=ACCEPT
+    firewall-cmd --permanent --policy=extender-nat --add-ingress-zone=nm-shared
+    firewall-cmd --permanent --policy=extender-nat --add-egress-zone=FedoraWorkstation
+    firewall-cmd --permanent --policy=extender-nat --add-masquerade
+    changed=1
+  fi
+  # Reply packets come back from the uplink zone into the dongle zone.
+  if ! firewall-cmd --permanent --info-policy=extender-back >/dev/null 2>&1; then
+    firewall-cmd --permanent --new-policy=extender-back
+    firewall-cmd --permanent --policy=extender-back --set-target=ACCEPT
+    firewall-cmd --permanent --policy=extender-back --add-ingress-zone=FedoraWorkstation
+    firewall-cmd --permanent --policy=extender-back --add-egress-zone=nm-shared
+    changed=1
+  fi
+  if [[ "${changed}" -eq 1 ]]; then
+    firewall-cmd --reload
+  fi
+}
+
+# The kernel names the dongle from the USB port (wlp0s20f0u1, wlp0s13f0u2, ...).
+# Pick the rtw88 stick even if extender.env still has an old name.
+find_usb_if() {
+  local iface driver
+  if [[ -n "${USB_IF}" && -d "/sys/class/net/${USB_IF}/device" ]]; then
+    driver="$(basename "$(readlink -f "/sys/class/net/${USB_IF}/device/driver" 2>/dev/null)" 2>/dev/null || true)"
+    if [[ "${driver}" == "rtw88_8822bu" ]]; then
+      return 0
+    fi
+  fi
+  for iface in /sys/class/net/*; do
+    iface="$(basename "${iface}")"
+    [[ "${iface}" == "lo" ]] && continue
+    driver="$(basename "$(readlink -f "/sys/class/net/${iface}/device/driver" 2>/dev/null)" 2>/dev/null || true)"
+    if [[ "${driver}" == "rtw88_8822bu" ]]; then
+      USB_IF="${iface}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+WATCH_PID="/run/extender-watch.pid"
+
+stop_watch() {
+  local pid
+  if [[ -f "${WATCH_PID}" ]]; then
+    pid="$(cat "${WATCH_PID}" 2>/dev/null || true)"
+    if [[ -n "${pid}" && "${pid}" != "$$" ]]; then
+      kill "${pid}" 2>/dev/null || true
+    fi
+    rm -f "${WATCH_PID}"
+  fi
+}
+
+start_watch() {
+  stop_watch
+  nohup "$0" --watch >>/var/log/extender-watch.log 2>&1 &
+  echo $! > "${WATCH_PID}"
+  echo "Watch running as pid $! (log: /var/log/extender-watch.log)."
+}
+
+watch_extender() {
+  echo $$ > "${WATCH_PID}"
+  local since now cooldown=0
+  since="$(date +%s)"
+  logger -t extender_go "watch started"
+  while true; do
+    sleep 30
+    if ! journalctl -k --since "@${since}" --no-pager -q 2>/dev/null | grep -q "error beacon valid"; then
+      continue
+    fi
+    now="$(date +%s)"
+    since="${now}"
+    if (( now - cooldown < 180 )); then
+      continue
+    fi
+    cooldown="${now}"
+    logger -t extender_go "beacon firmware stuck, reloading USB dongle only"
+    bring_up || logger -t extender_go "reload failed"
+    since="$(date +%s)"
+  done
+}
+
+bring_up() {
+  if ! find_usb_if; then
+    echo "TP-Link dongle not found. Plug it in. Last name in extender.env: ${USB_IF}." >&2
+    exit 1
+  fi
+
+  local internal_if
+  internal_if="$(nmcli -t -f DEVICE,TYPE,STATE device | awk -F: '$2=="wifi" && $3=="connected" && $1!="'"${USB_IF}"'" {print $1; exit}')"
+  if [[ -n "${internal_if}" && "${USB_IF}" == "${internal_if}" ]]; then
+    echo "Refusing to use the connected uplink interface ${USB_IF}." >&2
+    exit 1
+  fi
+
+  echo "Uplink stays on ${internal_if:-unknown}. Access point only on ${USB_IF}."
+
+  # After a stuck AP the firmware refuses a new config (device busy).
+  # Reload only the USB dongle driver. The internal Intel card uses iwlmld.
+  nmcli device disconnect "${USB_IF}" >/dev/null 2>&1 || true
+  modprobe -r rtw88_8822bu || true
+  sleep 1
+  modprobe rtw88_8822bu
+  local wait_i
+  for wait_i in 1 2 3 4 5 6 7 8 9 10; do
+    find_usb_if && break
+    sleep 0.4
+  done
+  if ! find_usb_if; then
+    echo "TP-Link dongle did not come back after the driver reload." >&2
+    exit 1
+  fi
+
+  # The 8822bu firmware drops clients when the USB radio enters power save.
+  if [[ -w /sys/module/rtw88_core/parameters/disable_lps_deep ]]; then
+    echo Y > /sys/module/rtw88_core/parameters/disable_lps_deep
+  fi
+  local usb_dev
+  usb_dev="$(readlink -f "/sys/class/net/${USB_IF}/device" 2>/dev/null || true)"
+  while [[ -n "${usb_dev}" && "${usb_dev}" != "/" ]]; do
+    if [[ -f "${usb_dev}/idVendor" && -f "${usb_dev}/power/control" ]]; then
+      echo on > "${usb_dev}/power/control"
+      break
+    fi
+    usb_dev="$(dirname "${usb_dev}")"
+  done
+
+  if nmcli -t -f NAME connection show | grep -qx "${CON_NAME}"; then
+    nmcli connection modify "${CON_NAME}" \
+      connection.interface-name "${USB_IF}" \
+      connection.autoconnect no \
+      802-11-wireless.ssid "${SSID}" \
+      802-11-wireless.mode ap \
+      802-11-wireless.band "${BAND}" \
+      802-11-wireless.channel "${CHANNEL}" \
+      802-11-wireless.powersave disable \
+      802-11-wireless.ap-isolation no \
+      802-11-wireless.cloned-mac-address permanent \
+      ipv4.method shared \
+      ipv6.method disabled
+    nmcli connection modify "${CON_NAME}" remove 802-11-wireless-security
+  else
+    nmcli connection add \
+      type wifi \
+      ifname "${USB_IF}" \
+      con-name "${CON_NAME}" \
+      autoconnect no \
+      ssid "${SSID}" \
+      wifi.mode ap \
+      wifi.band "${BAND}" \
+      wifi.channel "${CHANNEL}" \
+      wifi.powersave disable \
+      wifi.ap-isolation no \
+      wifi.cloned-mac-address permanent \
+      ipv4.method shared \
+      ipv6.method disabled
+  fi
+
+  nmcli connection up "${CON_NAME}"
+  iw dev "${USB_IF}" set power_save off || true
+  ensure_nat_policies
+  ensure_docker_forward
+
+  echo "Extender up: open SSID ${SSID} on ${USB_IF} (${BAND} ch ${CHANNEL})."
+}
+
+start_extender() {
+  stop_watch
+  bring_up
+  start_watch
+}
+
+stop_extender() {
+  stop_watch
+  remove_docker_forward || true
+  if nmcli -t -f NAME connection show | grep -qx "${CON_NAME}"; then
+    nmcli connection down "${CON_NAME}" || true
+    echo "Connection ${CON_NAME} is down. The profile is still saved for the next start."
+  else
+    echo "No connection named ${CON_NAME}."
+  fi
+}
+
+case "$1" in
+  --start) start_extender ;;
+  --stop) stop_extender ;;
+  --watch) watch_extender ;;
+esac
