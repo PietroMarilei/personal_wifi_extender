@@ -225,6 +225,11 @@ bring_up() {
       ipv6.method disabled
   fi
 
+  # The 8822bu firmware often drops the unicast DHCP offer.
+  # A broadcast offer still reaches the phone.
+  mkdir -p /etc/NetworkManager/dnsmasq-shared.d
+  printf '%s\n' 'dhcp-broadcast' > /etc/NetworkManager/dnsmasq-shared.d/extender-broadcast.conf
+
   nmcli connection up "${CON_NAME}"
   iw dev "${USB_IF}" set power_save off || true
   ensure_nat_policies

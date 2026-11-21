@@ -21,7 +21,7 @@ Edit `SSID`, `BAND` and `CHANNEL` in `extender.env`. `extender.env` is local and
 ./extender_go --stop
 ```
 
-`--start` asks for a password through polkit. It brings up the access point, NAT towards the uplink, and a watch that reloads only the dongle driver if the firmware stops sending beacons.
+`--start` asks for a password through polkit. It brings up the access point, NAT towards the uplink, and a watch that reloads only the dongle driver if the firmware stops sending beacons. DHCP offers are sent as broadcast, because this dongle often drops the unicast offer and the phone never gets an address.
 
 `--stop` turns the access point off and stops the watch. It does not start again at boot.
 
