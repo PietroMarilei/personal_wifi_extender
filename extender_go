@@ -134,7 +134,9 @@ watch_extender() {
   logger -t extender_go "watch started"
   while true; do
     sleep 30
-    if ! journalctl -k --since "@${since}" --no-pager -q 2>/dev/null | grep -q "error beacon valid"; then
+    # Beacon loss and missing TX reports are the same stuck firmware.
+    # The second one leaves the SSID up while phones get no replies.
+    if ! journalctl -k --since "@${since}" --no-pager -q 2>/dev/null | grep -Eq "error beacon valid|failed to get tx report"; then
       continue
     fi
     now="$(date +%s)"
@@ -143,7 +145,7 @@ watch_extender() {
       continue
     fi
     cooldown="${now}"
-    logger -t extender_go "beacon firmware stuck, reloading USB dongle only"
+    logger -t extender_go "dongle firmware stuck, reloading USB dongle only"
     bring_up || logger -t extender_go "reload failed"
     since="$(date +%s)"
   done
