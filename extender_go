@@ -37,52 +37,76 @@ fi
 
 export PATH="/usr/sbin:/sbin:${PATH}"
 
-# Docker sets filter FORWARD policy to drop and only accepts its bridges.
-# Packets from the dongle are forwarded traffic, so they die there.
-# DOCKER-USER is the chain Docker leaves for this kind of exception.
-ensure_docker_forward() {
+# NetworkManager uses 10.42.0.0/24 for an IPv4 shared connection.
+# Docker uses a global FORWARD drop policy. Its documented DOCKER-USER
+# extension chain therefore needs a narrow extender-only exception.
+PWE_ZONE="personal-wifi-extender"
+PWE_POLICY="pwe-nat"
+PWE_SUBNET="10.42.0.0/24"
+
+ensure_container_forward_exception() {
   local rule
   local -a rules=(
-    "-s 10.42.0.0/24 -i ${USB_IF} -j ACCEPT"
-    "-d 10.42.0.0/24 -o ${USB_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+    "-s ${PWE_SUBNET} -o ${INTERNAL_IF} -j ACCEPT"
+    "-d ${PWE_SUBNET} -i ${INTERNAL_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
   )
+
+  # Docker owns its chains. DOCKER-USER is the documented extension point
+  # for external firewall policy and is absent while Docker is stopped.
+  iptables -S DOCKER-USER >/dev/null 2>&1 || return 0
   for rule in "${rules[@]}"; do
     # shellcheck disable=SC2086
     iptables -C DOCKER-USER ${rule} 2>/dev/null || iptables -I DOCKER-USER 1 ${rule}
   done
 }
 
-remove_docker_forward() {
-  local spec
-  # Match the subnet, not the USB port name. A moved dongle gets a new interface.
-  while read -r spec; do
-    [[ -z "${spec}" ]] && continue
+remove_container_forward_exception() {
+  local rule
+  local -a rules=(
+    "-s ${PWE_SUBNET} -o ${INTERNAL_IF} -j ACCEPT"
+    "-d ${PWE_SUBNET} -i ${INTERNAL_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+  )
+
+  iptables -S DOCKER-USER >/dev/null 2>&1 || return 0
+  for rule in "${rules[@]}"; do
     # shellcheck disable=SC2086
-    iptables -D DOCKER-USER ${spec}
-  done < <(iptables -S DOCKER-USER | awk '/10\.42\.0\.0\/24/ {sub(/^-A DOCKER-USER /,""); print}')
+    while iptables -C DOCKER-USER ${rule} 2>/dev/null; do
+      iptables -D DOCKER-USER ${rule}
+    done
+  done
 }
 
-ensure_nat_policies() {
-  local changed=0
-  if ! firewall-cmd --permanent --info-policy=extender-nat >/dev/null 2>&1; then
-    firewall-cmd --permanent --new-policy=extender-nat
-    firewall-cmd --permanent --policy=extender-nat --set-target=ACCEPT
-    firewall-cmd --permanent --policy=extender-nat --add-ingress-zone=nm-shared
-    firewall-cmd --permanent --policy=extender-nat --add-egress-zone=FedoraWorkstation
-    firewall-cmd --permanent --policy=extender-nat --add-masquerade
-    changed=1
+ensure_extender_firewall() {
+  local uplink_if="$1"
+
+  if ! firewall-cmd --permanent --get-zones | tr ' ' '\n' | grep -qx "${PWE_ZONE}"; then
+    firewall-cmd --permanent --new-zone="${PWE_ZONE}"
   fi
-  # Reply packets come back from the uplink zone into the dongle zone.
-  if ! firewall-cmd --permanent --info-policy=extender-back >/dev/null 2>&1; then
-    firewall-cmd --permanent --new-policy=extender-back
-    firewall-cmd --permanent --policy=extender-back --set-target=ACCEPT
-    firewall-cmd --permanent --policy=extender-back --add-ingress-zone=FedoraWorkstation
-    firewall-cmd --permanent --policy=extender-back --add-egress-zone=nm-shared
-    changed=1
+  firewall-cmd --permanent --zone="${PWE_ZONE}" --set-target=DROP
+  firewall-cmd --permanent --zone="${PWE_ZONE}" --add-service=dhcp
+  firewall-cmd --permanent --zone="${PWE_ZONE}" --add-service=dns
+  firewall-cmd --permanent --zone="${PWE_ZONE}" --remove-service=ssh >/dev/null 2>&1 || true
+
+  if ! firewall-cmd --permanent --info-policy="${PWE_POLICY}" >/dev/null 2>&1; then
+    firewall-cmd --permanent --new-policy="${PWE_POLICY}"
+    firewall-cmd --permanent --policy="${PWE_POLICY}" --add-ingress-zone="${PWE_ZONE}"
+    firewall-cmd --permanent --policy="${PWE_POLICY}" --add-egress-zone=FedoraWorkstation
+    firewall-cmd --permanent --policy="${PWE_POLICY}" --add-masquerade
   fi
-  if [[ "${changed}" -eq 1 ]]; then
-    firewall-cmd --reload
-  fi
+  # This policy is scoped to extender -> uplink only. Without ACCEPT,
+  # the dedicated zone's DROP target blocks the packet after NAT is applied.
+  firewall-cmd --permanent --policy="${PWE_POLICY}" --set-target=ACCEPT
+
+  # Old policies were broad and used NetworkManager's shared zone.
+  firewall-cmd --permanent --delete-policy=extender-nat >/dev/null 2>&1 || true
+  firewall-cmd --permanent --delete-policy=extender-back >/dev/null 2>&1 || true
+  firewall-cmd --permanent --direct --remove-rule ipv4 filter FORWARD 0 -j PWE_FORWARD >/dev/null 2>&1 || true
+  firewall-cmd --permanent --direct --remove-rule ipv4 filter PWE_FORWARD 0 \
+    -s "${PWE_SUBNET}" -o "${uplink_if}" -j ACCEPT >/dev/null 2>&1 || true
+  firewall-cmd --permanent --direct --remove-rule ipv4 filter PWE_FORWARD 0 \
+    -i "${uplink_if}" -d "${PWE_SUBNET}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
+  firewall-cmd --permanent --direct --remove-chain ipv4 filter PWE_FORWARD >/dev/null 2>&1 || true
+  firewall-cmd --reload
 }
 
 # The kernel names the dongle from the USB port (wlp0s20f0u1, wlp0s13f0u2, ...).
@@ -108,6 +132,7 @@ find_usb_if() {
 }
 
 WATCH_PID="/run/extender-watch.pid"
+INTERNAL_IF=""
 
 stop_watch() {
   local pid
@@ -130,10 +155,15 @@ start_watch() {
 watch_extender() {
   echo $$ > "${WATCH_PID}"
   local since now cooldown=0
+  find_usb_if || exit 1
+  INTERNAL_IF="$(nmcli -t -f DEVICE,TYPE,STATE device | awk -F: '$2=="wifi" && $3=="connected" && $1!="'"${USB_IF}"'" {print $1; exit}')"
   since="$(date +%s)"
   logger -t extender_go "watch started"
   while true; do
     sleep 30
+    if [[ -n "${INTERNAL_IF}" ]]; then
+      ensure_container_forward_exception
+    fi
     # Beacon loss and missing TX reports are the same stuck firmware.
     # The second one leaves the SSID up while phones get no replies.
     if ! journalctl -k --since "@${since}" --no-pager -q 2>/dev/null | grep -Eq "error beacon valid|failed to get tx report"; then
@@ -163,8 +193,12 @@ bring_up() {
     echo "Refusing to use the connected uplink interface ${USB_IF}." >&2
     exit 1
   fi
+  if [[ -z "${internal_if}" ]]; then
+    echo "No connected Wi-Fi uplink was found." >&2
+    exit 1
+  fi
 
-  echo "Uplink stays on ${internal_if:-unknown}. Access point only on ${USB_IF}."
+  echo "Uplink stays on ${internal_if}. Access point only on ${USB_IF}."
 
   # After a stuck AP the firmware refuses a new config (device busy).
   # Reload only the USB dongle driver. The internal Intel card uses iwlmld.
@@ -196,10 +230,14 @@ bring_up() {
     usb_dev="$(dirname "${usb_dev}")"
   done
 
+  ensure_extender_firewall "${internal_if}"
+  INTERNAL_IF="${internal_if}"
+
   if nmcli -t -f NAME connection show | grep -qx "${CON_NAME}"; then
     nmcli connection modify "${CON_NAME}" \
       connection.interface-name "${USB_IF}" \
       connection.autoconnect no \
+      connection.zone "${PWE_ZONE}" \
       802-11-wireless.ssid "${SSID}" \
       802-11-wireless.mode ap \
       802-11-wireless.band "${BAND}" \
@@ -216,6 +254,7 @@ bring_up() {
       ifname "${USB_IF}" \
       con-name "${CON_NAME}" \
       autoconnect no \
+      connection.zone "${PWE_ZONE}" \
       ssid "${SSID}" \
       wifi.mode ap \
       wifi.band "${BAND}" \
@@ -234,8 +273,7 @@ bring_up() {
 
   nmcli connection up "${CON_NAME}"
   iw dev "${USB_IF}" set power_save off || true
-  ensure_nat_policies
-  ensure_docker_forward
+  ensure_container_forward_exception
 
   echo "Extender up: open SSID ${SSID} on ${USB_IF} (${BAND} ch ${CHANNEL})."
 }
@@ -248,7 +286,10 @@ start_extender() {
 
 stop_extender() {
   stop_watch
-  remove_docker_forward || true
+  if find_usb_if; then
+    INTERNAL_IF="$(nmcli -t -f DEVICE,TYPE,STATE device | awk -F: '$2=="wifi" && $3=="connected" && $1!="'"${USB_IF}"'" {print $1; exit}')"
+    [[ -n "${INTERNAL_IF}" ]] && remove_container_forward_exception
+  fi
   if nmcli -t -f NAME connection show | grep -qx "${CON_NAME}"; then
     nmcli connection down "${CON_NAME}" || true
     echo "Connection ${CON_NAME} is down. The profile is still saved for the next start."

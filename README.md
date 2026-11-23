@@ -21,9 +21,9 @@ Edit `SSID`, `BAND` and `CHANNEL` in `extender.env`. `extender.env` is local and
 ./extender_go --stop
 ```
 
-`--start` asks for a password through polkit. It brings up the access point, NAT towards the uplink, and a watch that reloads only the dongle driver if the firmware stops sending beacons. DHCP offers are sent as broadcast, because this dongle often drops the unicast offer and the phone never gets an address.
+`--start` asks for a password through polkit. It brings up the access point, NAT towards the uplink, and a watch that reloads only the dongle driver if the firmware stops sending beacons or delivering frames. DHCP offers are sent as broadcast, because this dongle often drops the unicast offer and the phone never gets an address.
 
-`--stop` turns the access point off and stops the watch. It does not start again at boot.
+`--stop` turns the access point off, stops the watch, and removes the temporary forwarding exceptions. It does not start again at boot.
 
 ## Window
 
@@ -35,4 +35,10 @@ The window shows uplink, access point, connected devices and the beacon watch. *
 
 ## Requirements
 
-Fedora with NetworkManager, firewalld, `iptables` and, for the window, GTK 4, libadwaita and VTE. Docker may be running: its `FORWARD` policy drops traffic that is not for a container, so the script adds an exception in `DOCKER-USER` for the extender subnet `10.42.0.0/24` only.
+Fedora with NetworkManager, firewalld and, for the window, GTK 4, libadwaita and VTE.
+
+## Firewall isolation
+
+The script creates a dedicated `personal-wifi-extender` firewalld zone for the USB adapter. It exposes only DHCP and DNS to connected devices, then allows the extender subnet `10.42.0.0/24` to reach the active Wi-Fi uplink with NAT.
+
+Docker sets a global `FORWARD` drop policy, so traffic from the extender must pass through Docker's documented `DOCKER-USER` extension chain. The script adds only two narrow rules: outbound packets from `10.42.0.0/24` to the Wi-Fi uplink and established reply packets back. It does not publish container ports, change Docker's daemon configuration, or add access to Docker bridges. The watchdog restores these two rules within 30 seconds after a Docker restart.
